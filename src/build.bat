@@ -31,11 +31,11 @@ if errorlevel 1 (
 rem --- generate the application manifest used by resource.rc -------------
 > _op22.manifest echo ^<?xml version="1.0" encoding="UTF-8" standalone="yes"?^>
 >>_op22.manifest echo ^<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"^>
->>_op22.manifest echo   ^<assemblyIdentity version="1.0.0.0" processorArchitecture="amd64" name="OP22.Native" type="win32"/^>
+>>_op22.manifest echo   ^<assemblyIdentity version="1.0.0.0" processorArchitecture="amd64" name="OP22.MT" type="win32"/^>
 >>_op22.manifest echo   ^<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"^>
 >>_op22.manifest echo     ^<security^>
 >>_op22.manifest echo       ^<requestedPrivileges^>
->>_op22.manifest echo         ^<requestedExecutionLevel level="asInvoker" uiAccess="false"/^>
+>>_op22.manifest echo         ^<requestedExecutionLevel level="requireAdministrator" uiAccess="false"/^>
 >>_op22.manifest echo       ^</requestedPrivileges^>
 >>_op22.manifest echo     ^</security^>
 >>_op22.manifest echo   ^</trustInfo^>
