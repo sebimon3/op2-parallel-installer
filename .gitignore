@@ -1,0 +1,25 @@
+# MSVC build artifacts
+*.obj
+*.res
+*.pdb
+*.exp
+*.ilk
+*.tlog
+*.idb
+_op22.manifest
+Precomp.h
+src/dist/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Verification output
+_scenario_*/
+_out/
+_work/
+
+# Local payload volumes and original installer
+*.bin
+op-2.2.exe
+OP22-Parallel-Setup.exe
