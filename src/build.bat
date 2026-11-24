@@ -76,7 +76,7 @@ rem --- compile & link ----------------------------------------------------
 if not exist dist mkdir dist
 cl /nologo /O2 /MT /W3 /utf-8 /Fe:dist\op-2.2-mt.exe ^
    main.c ui.c core.c lzma\LzmaDec.c _op22.res ^
-   /link comctl32.lib shell32.lib ole32.lib Shlwapi.lib user32.lib gdi32.lib advapi32.lib uxtheme.lib
+   /link comctl32.lib shell32.lib ole32.lib Shlwapi.lib user32.lib gdi32.lib advapi32.lib uxtheme.lib pdh.lib
 if errorlevel 1 goto fail
 
 del /q _op22.manifest _op22.res >nul 2>&1

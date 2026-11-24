@@ -8,6 +8,7 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <shellapi.h>
+#include <pdh.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +95,8 @@ static void load_wizard_assets(HINSTANCE hInst)
 #define ID_RADIO_COMMON 107
 #define ID_RADIO_CURRENT 108
 #define ID_PROGRESS    109
+#define ID_STATS       110
+#define ID_THREADS     111
 #define ID_LANG_COMBO  300
 #define ID_LANG_OK     301
 #define ID_LANG_CANCEL 302
@@ -105,6 +108,13 @@ static void load_wizard_assets(HINSTANCE hInst)
 #define WM_APP_DONE     (WM_APP + 2)
 
 #define MAX_ITEMS 512
+
+typedef struct {
+    DWORD t;
+    double tp;
+    double wr;
+    double du;
+} TelemetrySample;
 
 typedef struct {
     HWND hwnd;
@@ -121,11 +131,29 @@ typedef struct {
     char errbuf[1024];
     int lang;
 
-    HFONT font_ui, font_title, font_small;
+    HFONT font_ui, font_title, font_small, font_mono;
     HBRUSH brush_body;
 
     HWND hEdit, hBrowse, hComboLang, hComboType, hTree, hChkDesktop,
-         hRadioCommon, hRadioCurrent, hProgress;
+         hRadioCommon, hRadioCurrent, hProgress, hStats, hComboThreads;
+
+    /* debug progress telemetry */
+    PDH_HQUERY hPdh;
+    PDH_HCOUNTER hDisk;
+    PDH_HCOUNTER hWrites;
+    int disk_invert;             /* using "% Idle Time" instead of "% Disk Time" */
+    double disk_util;            /* 1-second average percentage */
+    WCHAR disk_letter;
+    double throughput_mbs;       /* decoded MiB/s (internal) */
+    double writes_mbs;           /* 1-second average disk writes MiB/s */
+    int last_active, last_total; /* preserved after workers finish */
+    int nprocs;
+    int worker_limit;            /* 0 = Auto */
+
+    TelemetrySample samples[128];
+    int sample_head, sample_count;
+    uint64_t last_bytes;
+    DWORD last_tick;
     HWND hBack, hNext, hCancel;
 
     WNDPROC old_tree_proc;
@@ -850,6 +878,8 @@ static void paint_main(HWND hwnd)
     case PG_READY:
         draw_text(hdc, g_manifest.s_ready_label, 32, 84, 420, 60,
                   g.font_ui, RGB(0,0,0), DT_LEFT | DT_TOP);
+        draw_text(hdc, "Worker threads:", 32, 183, 112, 20,
+                  g.font_ui, RGB(0,0,0), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         break;
     case PG_INSTALL:
         draw_text(hdc, g_manifest.s_installing, 32, 110, 420, 20,
@@ -951,6 +981,8 @@ static void set_page(Page p)
     SHOW(g.hRadioCommon, p == PG_TASKS);
     SHOW(g.hRadioCurrent, p == PG_TASKS);
     SHOW(g.hProgress, p == PG_INSTALL);
+    SHOW(g.hStats, p == PG_INSTALL);
+    SHOW(g.hComboThreads, p == PG_READY);
     SHOW(g.hBack, p == PG_COMP || p == PG_TASKS || p == PG_READY);
     SHOW(g.hNext, p != PG_INSTALL);
     SHOW(g.hCancel, p != PG_FINISH);
@@ -965,6 +997,150 @@ static void set_page(Page p)
 
     InvalidateRect(g.hwnd, NULL, TRUE);
     UpdateWindow(g.hwnd);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Debug install telemetry                                           */
+/* ------------------------------------------------------------------ */
+static void init_disk_telemetry(const char *output_dir)
+{
+    WCHAR path[128];
+    char letter = 0;
+    g.hPdh = NULL;
+    g.hDisk = NULL;
+    g.hWrites = NULL;
+    g.disk_invert = 0;
+    g.disk_util = 0.0;
+    g.disk_letter = 0;
+    if (!output_dir || !isalpha((unsigned char)output_dir[0]) || output_dir[1] != ':')
+        return;                       /* UNC or unknown -> no counter */
+    letter = (char)toupper((unsigned char)output_dir[0]);
+    g.disk_letter = (WCHAR)letter;
+    if (PdhOpenQueryW(NULL, 0, &g.hPdh) != ERROR_SUCCESS) {
+        g.hPdh = NULL;
+        return;
+    }
+    swprintf(path, 128, L"\\LogicalDisk(%c:)\\%% Disk Time", (WCHAR)letter);
+    if (PdhAddCounterW(g.hPdh, path, 0, &g.hDisk) != ERROR_SUCCESS) {
+        /* Localised systems may not expose the English counter name. */
+        swprintf(path, 128, L"\\LogicalDisk(%c:)\\%% Idle Time", (WCHAR)letter);
+        if (PdhAddCounterW(g.hPdh, path, 0, &g.hDisk) != ERROR_SUCCESS) {
+            PdhCloseQuery(g.hPdh);
+            g.hPdh = NULL;
+            return;
+        }
+        g.disk_invert = 1;
+    }
+    /* True bytes written to the target volume; if unavailable the decoded
+     * throughput is used as a fallback. */
+    swprintf(path, 128, L"\\LogicalDisk(%c:)\\Disk Write Bytes/sec", (WCHAR)letter);
+    PdhAddCounterW(g.hPdh, path, 0, &g.hWrites);
+    PdhCollectQueryData(g.hPdh);      /* establish a baseline sample */
+}
+
+static void close_disk_telemetry(void)
+{
+    if (g.hPdh) {
+        PdhCloseQuery(g.hPdh);
+        g.hPdh = NULL;
+        g.hDisk = NULL;
+        g.hWrites = NULL;
+    }
+}
+
+static double poll_disk_stats(double *write_mbs)
+{
+    PDH_FMT_COUNTERVALUE val;
+    double v = -1.0;
+    *write_mbs = -1.0;
+    if (!g.hPdh || !g.hDisk)
+        return -1.0;
+    if (PdhCollectQueryData(g.hPdh) != ERROR_SUCCESS)
+        return -1.0;
+    if (PdhGetFormattedCounterValue(g.hDisk, PDH_FMT_DOUBLE, NULL, &val) == ERROR_SUCCESS) {
+        v = val.doubleValue;
+        if (g.disk_invert) v = 100.0 - v;
+        if (v < 0.0) v = 0.0;
+        if (v > 100.0) v = 100.0;
+    }
+    if (g.hWrites &&
+        PdhGetFormattedCounterValue(g.hWrites, PDH_FMT_DOUBLE, NULL, &val) == ERROR_SUCCESS)
+        *write_mbs = val.doubleValue / 1048576.0;
+    return v;   /* raw sample; averaged over 1s by the caller */
+}
+
+/* Keep a ~1 second sliding window of instantaneous samples. */
+static void push_telemetry(double tp, double wr, double du)
+{
+    TelemetrySample *s = &g.samples[g.sample_head];
+    s->t = GetTickCount();
+    s->tp = tp;
+    s->wr = wr;
+    s->du = du;
+    g.sample_head = (g.sample_head + 1) % (int)(sizeof(g.samples) / sizeof(g.samples[0]));
+    if (g.sample_count < (int)(sizeof(g.samples) / sizeof(g.samples[0])))
+        ++g.sample_count;
+}
+
+static void average_telemetry(double *tp_avg, double *wr_avg, double *du_avg)
+{
+    DWORD now = GetTickCount();
+    DWORD cutoff = now > 1000u ? now - 1000u : 0u;
+    int i, idx, n = 0;
+    double tp_sum = 0.0, wr_sum = 0.0, du_sum = 0.0;
+    int wr_n = 0;
+    *tp_avg = 0.0;
+    *wr_avg = 0.0;
+    *du_avg = 0.0;
+    for (i = 0; i < g.sample_count; ++i) {
+        idx = (g.sample_head - 1 - i + (int)(sizeof(g.samples) / sizeof(g.samples[0])))
+              % (int)(sizeof(g.samples) / sizeof(g.samples[0]));
+        if (g.samples[idx].t < cutoff)
+            break;
+        tp_sum += g.samples[idx].tp;
+        du_sum += g.samples[idx].du;
+        if (g.samples[idx].wr >= 0.0) {
+            wr_sum += g.samples[idx].wr;
+            ++wr_n;
+        }
+        ++n;
+    }
+    if (n) {
+        *tp_avg = tp_sum / n;
+        *du_avg = du_sum / n;
+    }
+    if (wr_n) *wr_avg = wr_sum / wr_n;
+}
+
+static void refresh_stats_text(void)
+{
+    op22_thread_status st[64];
+    int n, i, active = 0;
+    WCHAR buf[512];
+    double writes = (g.writes_mbs >= 0.0) ? g.writes_mbs : g.throughput_mbs;
+    n = op22_get_thread_status(st, (int)(sizeof(st) / sizeof(st[0])));
+    if (n > 0) {
+        for (i = 0; i < n; ++i)
+            if (st[i].busy) ++active;
+        g.last_active = active;
+        g.last_total = n;
+    } else {
+        active = g.last_active;
+        n = g.last_total;
+    }
+    if (g.hPdh && g.hDisk)
+        _snwprintf_s(buf, 512, _TRUNCATE,
+                     L"Disk writes:   %6.1f MB/s\r\n"
+                     L"Disk activity: %5.1f%%\r\n"
+                     L"Active Threads: %d/%d\r\n",
+                     writes, g.disk_util, active, n);
+    else
+        _snwprintf_s(buf, 512, _TRUNCATE,
+                     L"Disk writes:   %6.1f MB/s\r\n"
+                     L"Disk activity: unavailable\r\n"
+                     L"Active Threads: %d/%d\r\n",
+                     writes, active, n);
+    SetWindowTextW(g.hStats, buf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -993,9 +1169,26 @@ static DWORD WINAPI install_thread(LPVOID param)
 
 static void start_install(void)
 {
+    char outpath[MAX_PATH];
+    WideCharToMultiByte(CP_UTF8, 0, g.dest, -1, outpath, MAX_PATH, NULL, NULL);
     g.install_result = -1;
     g.shortcuts_result = -1;
     g.progress_done = g.progress_total = 0;
+    g.last_bytes = 0;
+    g.last_tick = 0;
+    g.throughput_mbs = 0.0;
+    g.writes_mbs = -1.0;
+    g.disk_util = 0.0;
+    g.last_active = g.last_total = 0;
+    g.sample_head = 0;
+    g.sample_count = 0;
+    {
+        int sel = (int)SendMessageW(g.hComboThreads, CB_GETCURSEL, 0, 0);
+        g.worker_limit = (sel > 0) ? sel : 0;   /* item 0 = Auto */
+        op22_set_worker_limit(g.worker_limit);
+    }
+    SetWindowTextW(g.hStats, L"");
+    init_disk_telemetry(outpath);
     SendMessage(g.hProgress, PBM_SETRANGE32, 0, 100);
     SendMessage(g.hProgress, PBM_SETPOS, 0, 0);
     g.install_thread = CreateThread(NULL, 0, install_thread, NULL, 0, NULL);
@@ -1069,7 +1262,16 @@ static int wnd_create(HWND hwnd, LPCREATESTRUCTW cs)
     g.font_ui = make_font(-11, FW_NORMAL);
     g.font_title = make_font(-11, FW_BOLD);
     g.font_small = make_font(-11, FW_NORMAL);
+    g.font_mono = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                              DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     g.brush_body = CreateSolidBrush(RGB(240, 240, 240));
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        g.nprocs = (int)si.dwNumberOfProcessors;
+        if (g.nprocs < 1) g.nprocs = 1;
+    }
 
     memset(&icc, 0, sizeof(icc));
     icc.dwSize = sizeof(icc);
@@ -1161,6 +1363,33 @@ static int wnd_create(HWND hwnd, LPCREATESTRUCTW cs)
                                   32, 150, CONTENT_W, 22, hwnd,
                                   (HMENU)(INT_PTR)ID_PROGRESS, g.hInst, NULL);
     set_font(g.hProgress, g.font_ui);
+
+    /* Condensed install telemetry. */
+    g.hStats = CreateWindowExW(0, L"EDIT", L"",
+                               WS_CHILD | WS_VISIBLE | WS_BORDER |
+                               ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
+                               32, 184, CONTENT_W, 72, hwnd,
+                               (HMENU)(INT_PTR)ID_STATS, g.hInst, NULL);
+    SendMessageW(g.hStats, WM_SETFONT, (WPARAM)g.font_mono, TRUE);
+
+    /* Worker-count selector on the Ready page; item 0 is Auto (= nprocs). */
+    g.hComboThreads = CreateWindowExW(0, L"COMBOBOX", L"",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                      CBS_DROPDOWNLIST | WS_VSCROLL,
+                                      150, 180, 140, 21, hwnd,
+                                      (HMENU)(INT_PTR)ID_THREADS, g.hInst, NULL);
+    {
+        WCHAR label[64];
+        int i;
+        _snwprintf_s(label, 64, _TRUNCATE, L"Auto (%d threads)", g.nprocs);
+        SendMessageW(g.hComboThreads, CB_ADDSTRING, 0, (LPARAM)label);
+        for (i = 1; i <= g.nprocs; ++i) {
+            _snwprintf_s(label, 64, _TRUNCATE, L"%d", i);
+            SendMessageW(g.hComboThreads, CB_ADDSTRING, 0, (LPARAM)label);
+        }
+        SendMessageW(g.hComboThreads, CB_SETCURSEL, 0, 0);
+        set_font(g.hComboThreads, g.font_ui);
+    }
 
     g.hBack = make_button(ID_BTN_BACK, g_manifest.s_back, BTN_BX, BTN_Y, BTN_W, BTN_H);
     g.hNext = make_button(ID_BTN_NEXT, g_manifest.s_next, BTN_NX, BTN_Y, BTN_W, BTN_H);
@@ -1311,17 +1540,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
         return DefWindowProcW(hwnd, msg, w, l);
     }
 
-    case WM_APP_PROGRESS:
+    case WM_APP_PROGRESS: {
+        DWORD now = GetTickCount();
+        uint64_t bytes = (uint64_t)(int)w * 1024u;
         g.progress_done = (int)w;
         g.progress_total = (int)l;
         if (g.progress_total > 0) {
             SendMessageW(g.hProgress, PBM_SETRANGE32, 0, g.progress_total);
             SendMessageW(g.hProgress, PBM_SETPOS, g.progress_done, 0);
         }
+        {
+            double mbs = 0.0;
+            if (g.last_tick && now > g.last_tick && bytes >= g.last_bytes) {
+                double dt = (double)(now - g.last_tick) / 1000.0;
+                mbs = (double)(bytes - g.last_bytes) / 1048576.0 / dt;
+            }
+            g.last_bytes = bytes;
+            g.last_tick = now;
+            double wr = -1.0;
+            double du = poll_disk_stats(&wr);
+            push_telemetry(mbs, wr, du);
+            average_telemetry(&g.throughput_mbs, &g.writes_mbs, &g.disk_util);
+        }
+        refresh_stats_text();
         return 0;
+    }
 
     case WM_APP_DONE: {
         WCHAR msg[2048], cap[128];
+        refresh_stats_text();       /* preserve the final snapshot */
+        close_disk_telemetry();
         if (g.install_thread) {
             CloseHandle(g.install_thread);
             g.install_thread = NULL;

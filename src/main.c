@@ -190,6 +190,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine,
     const wchar_t *output_dir = NULL;
     const wchar_t *source_override = NULL;
     const wchar_t *components = NULL;
+    int workers = 0;
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     int i;
@@ -208,6 +209,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine,
                 source_override = argv[++i];
             else if (_wcsicmp(argv[i], L"--components") == 0 && i + 1 < argc)
                 components = argv[++i];
+            else if (_wcsicmp(argv[i], L"--workers") == 0 && i + 1 < argc)
+                workers = _wtoi(argv[++i]);
         }
         LocalFree(argv);
     }
@@ -218,6 +221,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine,
     else
         find_source_dir(source_dir, sizeof(source_dir));
 
+    op22_set_worker_limit(workers);
+
     if (verify_only) {
         setup_console();
         return run_verify_only(source_dir);
@@ -226,7 +231,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmdLine,
         setup_console();
         if (!output_dir) {
             printf("usage: OP-2.2 MT.exe --no-wizard --output-dir <path> "
-                   "[--source-dir <path>] [--components name1,name2,...]\n");
+                   "[--source-dir <path>] [--components name1,name2,...] "
+                   "[--workers N]\n");
             fflush(stdout);
             return 2;
         }

@@ -15,6 +15,35 @@
 #include <stdarg.h>
 #include <limits.h>
 
+struct work {
+    const char *source_dir;
+    const char *output_dir;   /* NULL = verify only */
+    const int *items;
+    int count;
+    int next;
+    CRITICAL_SECTION cs;
+    int failed;
+    char err[512];
+    op22_progress progress;
+    void *user;
+    uint64_t total_bytes;
+    volatile LONG64 done_bytes;
+    uint64_t last_reported;
+    uint64_t report_step;
+    op22_thread_status *statuses;
+    int status_count;
+    int next_slot;
+};
+typedef struct work work;
+
+static work *g_active_work = NULL;   /* for op22_get_thread_status() */
+static int g_worker_limit = 0;        /* 0 = use all logical processors */
+
+void op22_set_worker_limit(int n)
+{
+    g_worker_limit = (n > 0) ? n : 0;
+}
+
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
 
@@ -370,21 +399,62 @@ typedef struct {
     HANDLE file;
     unsigned char *mem;
     size_t mem_pos, mem_cap;
+    work *owner;              /* non-NULL while installing / verifying */
+    int slot;                 /* worker slot for live status */
 } sink;
+
+/* Report progress from actual decoded bytes rather than once per completed
+ * chunk.  Throttled so a 35 GiB install produces ~1000 updates instead of
+ * hundreds of thousands. */
+static void report_chunk_bytes(sink *s, size_t len)
+{
+    work *w = s->owner;
+    uint64_t done;
+    int emit = 0;
+    if (!w || !w->progress)
+        return;
+    InterlockedExchangeAdd64(&w->done_bytes, (LONG64)len);
+    EnterCriticalSection(&w->cs);
+    if (w->statuses && s->slot >= 0 && s->slot < w->status_count) {
+        op22_thread_status *st = &w->statuses[s->slot];
+        st->bytes_done += len;
+        if (st->bytes_done > st->bytes_total)
+            st->bytes_done = st->bytes_total;
+    }
+    done = (uint64_t)w->done_bytes;
+    if (done >= w->last_reported + w->report_step) {
+        w->last_reported = done;
+        emit = 1;
+    }
+    LeaveCriticalSection(&w->cs);
+    if (emit) {
+        int done_kb = (int)(done / 1024u);
+        int total_kb = (int)(w->total_bytes / 1024u);
+        if (done_kb < 0) done_kb = INT_MAX;
+        if (total_kb < 0) total_kb = INT_MAX;
+        w->progress(done_kb, total_kb, w->user);
+    }
+}
 
 static int sink_write(sink *s, const void *buf, size_t len)
 {
     if (len == 0)
         return 1;
-    if (s->mode == 1)
-        return write_all(s->file, buf, (DWORD)len);
+    if (s->mode == 1) {
+        if (!write_all(s->file, buf, (DWORD)len))
+            return 0;
+        report_chunk_bytes(s, len);
+        return 1;
+    }
     if (s->mode == 2) {
         if (s->mem_pos + len > s->mem_cap)
             return 0;
         memcpy(s->mem + s->mem_pos, buf, len);
         s->mem_pos += len;
+        report_chunk_bytes(s, len);
         return 1;
     }
+    report_chunk_bytes(s, len);   /* mode 0 (verify-only): still count bytes */
     return 1;
 }
 
@@ -584,28 +654,30 @@ static int file_selected(const op22_file *f, unsigned comp_mask)
 /* threaded extraction                                                 */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-    const char *source_dir;
-    const char *output_dir;   /* NULL = verify only */
-    const int *items;
-    int count;
-    int next;
-    CRITICAL_SECTION cs;
-    int failed;
-    char err[512];
-    op22_progress progress;
-    void *user;
-    uint64_t total_bytes;
-    uint64_t done_bytes;
-} work;
+int op22_get_thread_status(op22_thread_status *out, int max)
+{
+    work *w = g_active_work;
+    int n, i;
+    if (!w || !out || max <= 0)
+        return 0;
+    EnterCriticalSection(&w->cs);
+    n = (w->status_count < max) ? w->status_count : max;
+    for (i = 0; i < n; ++i)
+        out[i] = w->statuses[i];
+    LeaveCriticalSection(&w->cs);
+    return n;
+}
 
 static DWORD WINAPI worker_thread(LPVOID param)
 {
     work *w = (work *)param;
+    int slot;
+    EnterCriticalSection(&w->cs);
+    slot = w->next_slot++;
+    LeaveCriticalSection(&w->cs);
     for (;;) {
         int idx;
         char local_err[512];
-        uint64_t bytes;
         sink out;
         const op22_file *file = NULL;
         const op22_data *d;
@@ -624,6 +696,8 @@ static DWORD WINAPI worker_thread(LPVOID param)
 
         local_err[0] = '\0';
         memset(&out, 0, sizeof(out));
+        out.owner = w;
+        out.slot = slot;
         if (w->output_dir) {
             file = &g_manifest.files[idx];
             full = join_path(w->output_dir, file->dest);
@@ -646,30 +720,39 @@ static DWORD WINAPI worker_thread(LPVOID param)
             }
             out.mode = 1;
             d = &g_manifest.data[file->location];
-            bytes = d->uncompressed_size;
         } else {
             d = &g_manifest.data[idx];
-            bytes = d->uncompressed_size;
         }
+
+        EnterCriticalSection(&w->cs);
+        if (w->statuses && slot >= 0 && slot < w->status_count) {
+            op22_thread_status *st = &w->statuses[slot];
+            st->busy = 1;
+            st->data_index = file ? file->location : idx;
+            st->file_index = file ? idx : -1;
+            st->dest = file ? file->dest : NULL;
+            st->bytes_done = 0;
+            st->bytes_total = d->uncompressed_size;
+            st->thread_id = GetCurrentThreadId();
+        }
+        LeaveCriticalSection(&w->cs);
 
         if (!decode_entry(d, w->source_dir, g_manifest.slices_per_disk,
                           &out, local_err, sizeof(local_err)))
             goto fail;
 
+        EnterCriticalSection(&w->cs);
+        if (w->statuses && slot >= 0 && slot < w->status_count) {
+            op22_thread_status *st = &w->statuses[slot];
+            st->busy = 0;
+            st->bytes_done = st->bytes_total;
+        }
+        LeaveCriticalSection(&w->cs);
+
         if (out.file && out.file != INVALID_HANDLE_VALUE)
             CloseHandle(out.file);
         free(wf);
         free(full);
-        EnterCriticalSection(&w->cs);
-        w->done_bytes += bytes;
-        if (w->progress) {
-            int done_kb = (int)(w->done_bytes / 1024u);
-            int total_kb = (int)(w->total_bytes / 1024u);
-            if (done_kb < 0) done_kb = INT_MAX;
-            if (total_kb < 0) total_kb = INT_MAX;
-            w->progress(done_kb, total_kb, w->user);
-        }
-        LeaveCriticalSection(&w->cs);
         continue;
 
     fail:
@@ -707,19 +790,33 @@ static int run_jobs(const char *source_dir, const char *output_dir,
     w.progress = progress;
     w.user = user;
     w.total_bytes = total_bytes;
+    /* Emit roughly one update per 0.1% of the payload, bounded to 4-64 MiB. */
+    w.report_step = total_bytes / 1000u;
+    if (w.report_step < (4u << 20)) w.report_step = (4u << 20);
+    if (w.report_step > (64u << 20)) w.report_step = (64u << 20);
+    w.last_reported = 0;
     InitializeCriticalSection(&w.cs);
 
     GetSystemInfo(&si);
-    /* Windows equivalent of nproc: one worker per logical processor. */
-    nthreads = (int)si.dwNumberOfProcessors;
+    /* Windows equivalent of nproc: one worker per logical processor,
+     * unless the user chose a smaller limit on the Ready page. */
+    nthreads = (g_worker_limit > 0) ? g_worker_limit : (int)si.dwNumberOfProcessors;
     if (nthreads < 1) nthreads = 1;
+    if ((int)si.dwNumberOfProcessors > 0 && nthreads > (int)si.dwNumberOfProcessors)
+        nthreads = (int)si.dwNumberOfProcessors;
     if (count > 0 && nthreads > count) nthreads = count;
     threads = (HANDLE *)calloc((size_t)nthreads, sizeof(HANDLE));
-    if (!threads) {
+    w.statuses = (op22_thread_status *)calloc((size_t)nthreads,
+                                              sizeof(op22_thread_status));
+    if (!threads || !w.statuses) {
         set_err(err, errlen, "out of memory allocating worker handles");
+        free(threads);
+        free(w.statuses);
         DeleteCriticalSection(&w.cs);
         return 1;
     }
+    w.status_count = nthreads;
+    g_active_work = &w;
 
     for (i = 0; i < nthreads; ++i) {
         threads[i] = CreateThread(NULL, 0, worker_thread, &w, 0, NULL);
@@ -731,7 +828,16 @@ static int run_jobs(const char *source_dir, const char *output_dir,
     for (i = 0; i < started; ++i)
         CloseHandle(threads[i]);
     free(threads);
+    g_active_work = NULL;
     DeleteCriticalSection(&w.cs);
+    free(w.statuses);
+
+    /* Pin the bar to 100% even if the last increment was below the step. */
+    if (progress && !w.failed) {
+        int total_kb = (int)(total_bytes / 1024u);
+        if (total_kb < 0) total_kb = INT_MAX;
+        progress(total_kb, total_kb, user);
+    }
 
     if (w.failed) {
         set_err(err, errlen, "%s", w.err);
